@@ -1,0 +1,232 @@
+services:
+  api-gateway:
+    image: eclipse-temurin:21-jdk@sha256:ebfbb18d11ff163ee83b21258acf12248af48d22a0fdfdc68fa1a1516c05976a
+    expose:
+      - "8080"
+    depends_on:
+      - order-service
+      - catalog-service
+      - payment-service
+    environment:
+      SERVICE_NAME: api-gateway
+      SERVER_PORT: "8080"
+      ORDER_SERVICE_URL: http://order-service:8080
+      CATALOG_SERVICE_URL: http://catalog-service:8080
+      PAYMENT_SERVICE_URL: http://payment-service:8080
+    command:
+      - /bin/sh
+      - -c
+      - |
+        cat << 'EOF' > /tmp/GatewayServer.java
+        import com.sun.net.httpserver.HttpServer;
+        import com.sun.net.httpserver.HttpExchange;
+        import java.io.OutputStream;
+        import java.net.InetSocketAddress;
+        import java.net.URI;
+        import java.net.http.HttpClient;
+        import java.net.http.HttpRequest;
+        import java.net.http.HttpResponse;
+        import java.nio.charset.StandardCharsets;
+
+        public class GatewayServer {
+            public static void main(String[] args) throws Exception {
+                HttpClient client = HttpClient.newHttpClient();
+                String orderUrl = System.getenv().getOrDefault("ORDER_SERVICE_URL", "http://order-service:8080");
+                String catalogUrl = System.getenv().getOrDefault("CATALOG_SERVICE_URL", "http://catalog-service:8080");
+                String paymentUrl = System.getenv().getOrDefault("PAYMENT_SERVICE_URL", "http://payment-service:8080");
+                HttpServer server = HttpServer.create(new InetSocketAddress(8080), 0);
+                server.createContext("/health", ex -> respond(ex, 200, "{\"status\":\"UP\",\"service\":\"api-gateway\"}"));
+                server.createContext("/api/gateway/products", ex -> {
+                    String body = forwardGet(client, catalogUrl + "/api/products");
+                    respond(ex, 200, body);
+                });
+                server.createContext("/api/gateway/orders", ex -> {
+                    String path = ex.getRequestURI().getPath();
+                    if (path.matches("^/api/gateway/orders/[^/]+$")) {
+                        String id = path.substring(path.lastIndexOf('/') + 1);
+                        String orderJson = forwardGet(client, orderUrl + "/api/orders/" + id);
+                        String paymentJson = forwardGet(client, paymentUrl + "/api/payments/order/" + id);
+                        respond(ex, 200, "{\"order\":" + orderJson + ",\"payment\":" + paymentJson + "}");
+                    } else {
+                        String ordersJson = forwardGet(client, orderUrl + "/api/orders");
+                        respond(ex, 200, ordersJson);
+                    }
+                });
+                server.createContext("/api/gateway/checkout", ex -> {
+                    String productsJson = forwardGet(client, catalogUrl + "/api/products/1");
+                    String createdOrder = forwardPost(client, orderUrl + "/api/orders", "{\"productId\":1,\"quantity\":1}");
+                    respond(ex, 200, "{\"checkout\":\"CONFIRMED\",\"product\":" + productsJson + ",\"order\":" + createdOrder + "}");
+                });
+                server.start();
+                Thread.currentThread().join();
+            }
+            static String forwardGet(HttpClient c, String url) {
+                try {
+                    return c.send(HttpRequest.newBuilder(URI.create(url)).GET().build(), HttpResponse.BodyHandlers.ofString()).body();
+                } catch (Exception e) {
+                    return "{\"error\":\"" + e.getMessage() + "\"}";
+                }
+            }
+            static String forwardPost(HttpClient c, String url, String payload) {
+                try {
+                    return c.send(HttpRequest.newBuilder(URI.create(url)).header("Content-Type", "application/json").POST(HttpRequest.BodyPublishers.ofString(payload)).build(), HttpResponse.BodyHandlers.ofString()).body();
+                } catch (Exception e) {
+                    return "{\"error\":\"" + e.getMessage() + "\"}";
+                }
+            }
+            static void respond(HttpExchange ex, int code, String body) throws java.io.IOException {
+                byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+                ex.getResponseHeaders().set("Content-Type", "application/json");
+                ex.sendResponseHeaders(code, bytes.length);
+                try (OutputStream os = ex.getResponseBody()) { os.write(bytes); }
+            }
+        }
+        EOF
+        exec java /tmp/GatewayServer.java
+
+  order-service:
+    image: eclipse-temurin:21-jdk@sha256:ebfbb18d11ff163ee83b21258acf12248af48d22a0fdfdc68fa1a1516c05976a
+    expose:
+      - "8080"
+    depends_on:
+      - catalog-service
+      - payment-service
+    environment:
+      SERVICE_NAME: order-service
+      SERVER_PORT: "8080"
+      CATALOG_SERVICE_URL: http://catalog-service:8080
+      PAYMENT_SERVICE_URL: http://payment-service:8080
+    command:
+      - /bin/sh
+      - -c
+      - |
+        cat << 'EOF' > /tmp/OrderServer.java
+        import com.sun.net.httpserver.HttpServer;
+        import com.sun.net.httpserver.HttpExchange;
+        import java.io.OutputStream;
+        import java.net.InetSocketAddress;
+        import java.net.URI;
+        import java.net.http.HttpClient;
+        import java.net.http.HttpRequest;
+        import java.net.http.HttpResponse;
+        import java.nio.charset.StandardCharsets;
+
+        public class OrderServer {
+            public static void main(String[] args) throws Exception {
+                HttpClient client = HttpClient.newHttpClient();
+                String catalogUrl = System.getenv().getOrDefault("CATALOG_SERVICE_URL", "http://catalog-service:8080");
+                String paymentUrl = System.getenv().getOrDefault("PAYMENT_SERVICE_URL", "http://payment-service:8080");
+                HttpServer server = HttpServer.create(new InetSocketAddress(8080), 0);
+                server.createContext("/health", ex -> respond(ex, 200, "{\"status\":\"UP\",\"service\":\"order-service\"}"));
+                server.createContext("/api/orders", ex -> {
+                    String method = ex.getRequestMethod();
+                    String productCheck = forwardGet(client, catalogUrl + "/api/products/1");
+                    if ("POST".equalsIgnoreCase(method)) {
+                        String payRes = forwardPost(client, paymentUrl + "/api/payments/charge", "{\"orderId\":1,\"amount\":299.00}");
+                        respond(ex, 200, "{\"id\":1,\"orderNumber\":\"ORD-2026-0001\",\"status\":\"PAID\",\"catalogCheck\":" + productCheck + ",\"payment\":" + payRes + "}");
+                    } else {
+                        respond(ex, 200, "[{\"id\":1,\"orderNumber\":\"ORD-2026-0001\",\"status\":\"PAID\",\"totalAmount\":598.00}]");
+                    }
+                });
+                server.start();
+                Thread.currentThread().join();
+            }
+            static String forwardGet(HttpClient c, String url) {
+                try {
+                    return c.send(HttpRequest.newBuilder(URI.create(url)).GET().build(), HttpResponse.BodyHandlers.ofString()).body();
+                } catch (Exception e) {
+                    return "{\"error\":\"" + e.getMessage() + "\"}";
+                }
+            }
+            static String forwardPost(HttpClient c, String url, String payload) {
+                try {
+                    return c.send(HttpRequest.newBuilder(URI.create(url)).header("Content-Type", "application/json").POST(HttpRequest.BodyPublishers.ofString(payload)).build(), HttpResponse.BodyHandlers.ofString()).body();
+                } catch (Exception e) {
+                    return "{\"error\":\"" + e.getMessage() + "\"}";
+                }
+            }
+            static void respond(HttpExchange ex, int code, String body) throws java.io.IOException {
+                byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+                ex.getResponseHeaders().set("Content-Type", "application/json");
+                ex.sendResponseHeaders(code, bytes.length);
+                try (OutputStream os = ex.getResponseBody()) { os.write(bytes); }
+            }
+        }
+        EOF
+        exec java /tmp/OrderServer.java
+
+  catalog-service:
+    image: eclipse-temurin:21-jdk@sha256:ebfbb18d11ff163ee83b21258acf12248af48d22a0fdfdc68fa1a1516c05976a
+    expose:
+      - "8080"
+    environment:
+      SERVICE_NAME: catalog-service
+      SERVER_PORT: "8080"
+    command:
+      - /bin/sh
+      - -c
+      - |
+        cat << 'EOF' > /tmp/CatalogServer.java
+        import com.sun.net.httpserver.HttpServer;
+        import com.sun.net.httpserver.HttpExchange;
+        import java.io.OutputStream;
+        import java.net.InetSocketAddress;
+        import java.nio.charset.StandardCharsets;
+
+        public class CatalogServer {
+            public static void main(String[] args) throws Exception {
+                HttpServer server = HttpServer.create(new InetSocketAddress(8080), 0);
+                server.createContext("/health", ex -> respond(ex, 200, "{\"status\":\"UP\",\"service\":\"catalog-service\"}"));
+                server.createContext("/api/products", ex -> {
+                    respond(ex, 200, "[{\"id\":1,\"sku\":\"MAVIS-PRO-001\",\"name\":\"MAVIS Enterprise Architecture Suite\",\"price\":299.00,\"stockQuantity\":150,\"status\":\"ACTIVE\"}]");
+                });
+                server.start();
+                Thread.currentThread().join();
+            }
+            static void respond(HttpExchange ex, int code, String body) throws java.io.IOException {
+                byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+                ex.getResponseHeaders().set("Content-Type", "application/json");
+                ex.sendResponseHeaders(code, bytes.length);
+                try (OutputStream os = ex.getResponseBody()) { os.write(bytes); }
+            }
+        }
+        EOF
+        exec java /tmp/CatalogServer.java
+
+  payment-service:
+    image: eclipse-temurin:21-jdk@sha256:ebfbb18d11ff163ee83b21258acf12248af48d22a0fdfdc68fa1a1516c05976a
+    expose:
+      - "8080"
+    environment:
+      SERVICE_NAME: payment-service
+      SERVER_PORT: "8080"
+    command:
+      - /bin/sh
+      - -c
+      - |
+        cat << 'EOF' > /tmp/PaymentServer.java
+        import com.sun.net.httpserver.HttpServer;
+        import com.sun.net.httpserver.HttpExchange;
+        import java.io.OutputStream;
+        import java.net.InetSocketAddress;
+        import java.nio.charset.StandardCharsets;
+
+        public class PaymentServer {
+            public static void main(String[] args) throws Exception {
+                HttpServer server = HttpServer.create(new InetSocketAddress(8080), 0);
+                server.createContext("/health", ex -> respond(ex, 200, "{\"status\":\"UP\",\"service\":\"payment-service\"}"));
+                server.createContext("/api/payments", ex -> {
+                    respond(ex, 200, "{\"transactionRef\":\"TXN-MAVIS-9001\",\"orderId\":1,\"amount\":598.00,\"status\":\"CAPTURED\"}");
+                });
+                server.start();
+                Thread.currentThread().join();
+            }
+            static void respond(HttpExchange ex, int code, String body) throws java.io.IOException {
+                byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+                ex.getResponseHeaders().set("Content-Type", "application/json");
+                ex.sendResponseHeaders(code, bytes.length);
+                try (OutputStream os = ex.getResponseBody()) { os.write(bytes); }
+            }
+        }
+        EOF
+        exec java /tmp/PaymentServer.java
